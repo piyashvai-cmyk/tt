@@ -1799,6 +1799,12 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                 if play_matches:
                     await asyncio.gather(*play_matches, return_exceptions=True)
                 play_matches.clear()
+                if writer:
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
                 raise
             except Exception as e:
                 print_error(f"[FUNCTIONAL] TCP state ({uid_str}): {e}")
@@ -1833,6 +1839,12 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
         if play_matches:
             await asyncio.gather(*play_matches, return_exceptions=True)
         play_matches.clear()
+        if writer:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
         raise
 
 
@@ -2235,6 +2247,7 @@ async def run_account_worker(account_data: Dict, label: str):
     acc_id = str(account_data['account_id'])
     informational_task = None
     exp_task = None
+    functional_task = None
     try:
         reg = account_data.get('region', 'ID')
         tcp_packet_online = await build_tcp_startup_packet(
@@ -2301,10 +2314,13 @@ async def run_account_worker(account_data: Dict, label: str):
     except Exception as e:
         print_error(f"run_account_worker error for {label}: {e}")
     finally:
-        for t in (informational_task, exp_task):
+        # The functional worker owns the live game TCP/UDP sessions. Cancel and
+        # await it too; otherwise deleting/pausing an account can leave sessions alive.
+        children = (functional_task, informational_task, exp_task)
+        for t in children:
             if t and not t.done():
                 t.cancel()
-        for t in (informational_task, exp_task):
+        for t in children:
             if t:
                 try:
                     await t
@@ -2362,6 +2378,12 @@ async def account_loop_token(token: str):
             await asyncio.sleep(3)
         except asyncio.CancelledError:
             print_warning(f"Worker for token {token_label} stopped.")
+            try:
+                cached = cache_get(f"tok_{token[:20]}")
+                if cached:
+                    bot_state.update_status(str(cached.get("account_id", "")), "OFFLINE", 0)
+            except Exception:
+                pass
             break
         except Exception as e:
             print_error(f"Token error: {e}. Retrying in 10s...")
@@ -2381,9 +2403,8 @@ def load_accounts():
         except Exception as e:
             print_error(f"Could not load {ACCOUNTS_FILE}: {e}")
 
-    if not accounts and FALLBACK_UID and FALLBACK_PASSWORD:
-        accounts.append({"uid": FALLBACK_UID, "password": FALLBACK_PASSWORD})
-
+    # accounts.json is the single source of truth. Do not silently resurrect
+    # deleted accounts from fallback credentials when the file becomes empty.
     return accounts
 
 
@@ -2432,8 +2453,218 @@ async def main():
     async def on_refresh_account_handler(uid):
         await refresh_account_profile(uid)
 
+    async def _stop_worker_for_uid(uid: str, token_hint: str = "", auth_uid_hint: str = ""):
+        """Cancel and await every worker key belonging to one displayed account."""
+        uid = str(uid or "").strip()
+        auth_uid_hint = str(auth_uid_hint or "").strip()
+        keys = set()
+        if uid:
+            keys.add(uid)
+        if auth_uid_hint:
+            keys.add(auth_uid_hint)
+        if token_hint:
+            keys.add(str(token_hint).strip()[:10])
+
+        # Resolve displayed game UID -> saved login UID / token worker key.
+        for lookup_uid in (uid, auth_uid_hint):
+            if not lookup_uid:
+                continue
+            data = bot_state.account_credentials.get(lookup_uid, {})
+            if data:
+                auth_uid = str(data.get("auth_uid", "") or "").strip()
+                if auth_uid:
+                    keys.add(auth_uid)
+                for token_field in ("auth_token", "access_token"):
+                    auth_token = str(data.get(token_field, "") or "").strip()
+                    if auth_token:
+                        keys.add(auth_token[:10])
+
+        # Cached credential aliases can also point at the same game account.
+        for data in list(bot_state.account_credentials.values()):
+            if uid and str(data.get("account_id", "")) == uid:
+                auth_uid = str(data.get("auth_uid", "") or "").strip()
+                if auth_uid:
+                    keys.add(auth_uid)
+                for token_field in ("auth_token", "access_token"):
+                    auth_token = str(data.get(token_field, "") or "").strip()
+                    if auth_token:
+                        keys.add(auth_token[:10])
+
+        tasks = []
+        seen = set()
+        for key in keys:
+            task = bot_state.account_workers.pop(key, None)
+            if task and id(task) not in seen:
+                seen.add(id(task))
+                if not task.done():
+                    task.cancel()
+                tasks.append(task)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Set the visible game-account row after cancellation has completed.
+        if uid in bot_state.accounts:
+            bot_state.update_status(uid, "PAUSED" if bot_state.accounts[uid].get("is_paused") else "OFFLINE", 0)
+        if auth_uid_hint in bot_state.accounts and auth_uid_hint != uid:
+            bot_state.update_status(auth_uid_hint, "PAUSED" if bot_state.accounts[auth_uid_hint].get("is_paused") else "OFFLINE", 0)
+
+    async def _start_worker_for_uid(uid: str):
+        """Resume an account by resolving its displayed UID to its saved login credential.
+
+        Dashboard rows use the in-game account ID, while workers are keyed by the
+        original login UID or token prefix. Resolve all aliases before creating a
+        worker and avoid creating a duplicate task for the same credential.
+        """
+        uid = str(uid or "").strip()
+        if not uid:
+            return False
+
+        saved = await _load_accounts_file()
+        data = bot_state.account_credentials.get(uid, {})
+        if not data:
+            data = next((item for item in bot_state.account_credentials.values()
+                         if str(item.get("account_id", "")).strip() == uid), {})
+
+        auth_uid = str(data.get("auth_uid", "") or "").strip()
+        access_token = str(data.get("auth_token", "") or data.get("access_token", "") or "").strip()
+        source = next((item for item in saved
+                       if str(item.get("uid", "") or "").strip() in {uid, auth_uid} and item.get("password")), None)
+        if source is None and access_token:
+            source = next((item for item in saved
+                           if str(item.get("token", "") or "").strip() == access_token), None)
+
+        # Prefer the saved account record (the source of truth), but allow the
+        # live credential cache to recover if a saved record was normalized or
+        # re-keyed while the account remains in the dashboard.
+        if source and source.get("token"):
+            token = str(source["token"]).strip()
+            key = token[:10]
+            worker_coro = lambda: account_loop_token(token)
+        elif source and source.get("uid") and source.get("password"):
+            source_uid = str(source["uid"]).strip()
+            password = str(source["password"])
+            key = source_uid
+            worker_coro = lambda: account_loop_guest(source_uid, password)
+        elif data.get("auth_type") == "guest" and auth_uid and data.get("auth_password"):
+            key = auth_uid
+            password = str(data["auth_password"])
+            worker_coro = lambda: account_loop_guest(auth_uid, password)
+        elif data.get("auth_type") == "token" and access_token:
+            key = access_token[:10]
+            worker_coro = lambda: account_loop_token(access_token)
+        else:
+            bot_state.log(f"Resume failed for {uid}: saved login credentials could not be resolved.", "error", uid)
+            return False
+
+        current = bot_state.account_workers.get(key)
+        if current and not current.done():
+            bot_state.log(f"Resume skipped for {uid}: worker is already running.", "info", uid)
+            return True
+
+        task = asyncio.create_task(worker_coro(), name=f"account-worker:{key}")
+        bot_state.account_workers[key] = task
+
+        def _clear_finished_worker(done_task, worker_key=key):
+            # Do not remove a newer replacement task registered under the same key.
+            if bot_state.account_workers.get(worker_key) is done_task:
+                bot_state.account_workers.pop(worker_key, None)
+
+        task.add_done_callback(_clear_finished_worker)
+        bot_state.log(f"Resume started worker for {uid} (worker key: {key[:10]}).", "success", uid)
+        return True
+
+    async def on_account_pause_handler(uid):
+        await _stop_worker_for_uid(uid)
+        return True
+
+    async def on_account_resume_handler(uid):
+        return await _start_worker_for_uid(uid)
+
+    async def on_account_restart_handler(uid):
+        await _stop_worker_for_uid(uid)
+        await asyncio.sleep(0.25)
+        return await _start_worker_for_uid(uid)
+
+    async def on_account_delete_handler(uid, token="", auth_uid=""):
+        await _stop_worker_for_uid(uid, token, auth_uid)
+
     bot_state.refresh_callbacks["on_account_added"] = on_account_added_handler
     bot_state.refresh_callbacks["on_refresh_account"] = on_refresh_account_handler
+    bot_state.refresh_callbacks["on_account_pause"] = on_account_pause_handler
+    bot_state.refresh_callbacks["on_account_resume"] = on_account_resume_handler
+    bot_state.refresh_callbacks["on_account_restart"] = on_account_restart_handler
+    bot_state.refresh_callbacks["on_account_delete"] = on_account_delete_handler
+
+    DAILY_EXP_LIMIT = 40000
+    DAILY_RESET_HOUR_BD = 7
+
+    async def daily_limit_manager():
+        """Enforce a per-account 40,000 daily EXP cap; reset at 07:00 Bangladesh time."""
+        from datetime import timedelta, timezone
+        bd_tz = timezone(timedelta(hours=6))
+        while True:
+            try:
+                now = datetime.now(bd_tz)
+                cycle_day = (now.date() - timedelta(days=1) if now.hour < DAILY_RESET_HOUR_BD else now.date()).isoformat()
+                for uid, acc in list(bot_state.accounts.items()):
+                    daily = bot_state.ensure_daily_state(uid, int(acc.get("current_exp", 0) or 0))
+                    was_daily_paused = bool(daily.get("daily_paused"))
+                    if str(daily.get("cycle_date", "")) != cycle_day:
+                        daily["cycle_date"] = cycle_day
+                        daily["daily_gained_exp"] = 0
+                        daily["daily_paused"] = False
+                        daily["last_exp"] = int(acc.get("current_exp", 0) or 0)
+                        bot_state.save_daily_limits()
+                        acc["daily_gained_exp"] = 0
+                        acc["daily_paused"] = False
+                        bot_state.log(f"Daily EXP counter reset for {uid} at 07:00 Bangladesh time.", "info", uid)
+                        if was_daily_paused and not bool(daily.get("manual_paused")):
+                            result = await on_account_resume_handler(uid)
+                            if result is not False:
+                                acc["is_paused"] = False
+                                acc["status"] = "CONNECTING"
+                                acc["active_matches"] = 0
+                                bot_state.log(f"Daily limit reset: account {uid} automatically resumed.", "success", uid)
+                            else:
+                                acc["is_paused"] = True
+                                acc["status"] = "OFFLINE"
+                                bot_state.log(f"Daily reset could not resume {uid}: credentials unavailable.", "error", uid)
+
+                    daily_gain = int(daily.get("daily_gained_exp", 0) or 0)
+                    acc["daily_gained_exp"] = daily_gain
+                    acc["daily_limit_exp"] = DAILY_EXP_LIMIT
+                    acc["daily_paused"] = bool(daily.get("daily_paused"))
+                    acc["manual_paused"] = bool(daily.get("manual_paused"))
+
+                    if daily_gain >= DAILY_EXP_LIMIT and not bool(daily.get("daily_paused")):
+                        daily["daily_paused"] = True
+                        bot_state.save_daily_limits()
+                        acc["daily_paused"] = True
+                        bot_state.log(f"Daily limit reached for {uid}: {daily_gain:,}/{DAILY_EXP_LIMIT:,} EXP. Account paused until 07:00 BD time.", "warning", uid)
+                        if not bool(daily.get("manual_paused")):
+                            await on_account_pause_handler(uid)
+                            acc["is_paused"] = True
+                            acc["status"] = "PAUSED"
+                            acc["active_matches"] = 0
+
+                    if bool(daily.get("manual_paused")) or bool(daily.get("daily_paused")):
+                        # Always enforce persisted pause flags: after a process restart the
+                        # login worker may start before its game UID is known to the dashboard.
+                        await on_account_pause_handler(uid)
+                        acc["is_paused"] = True
+                        acc["status"] = "PAUSED"
+                        acc["active_matches"] = 0
+                    else:
+                        acc["is_paused"] = False
+                bot_state.save_daily_limits()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                bot_state.log(f"Daily XP manager error: {exc}", "error")
+            await asyncio.sleep(10)
+
+    daily_manager_task = asyncio.create_task(daily_limit_manager(), name="daily-exp-limit-manager")
+    bot_state.log("Daily XP cap enabled: 40,000 EXP per account; automatic resume at 07:00 Bangladesh time.", "success")
 
     accounts = load_accounts()
 
@@ -2459,6 +2690,11 @@ async def main():
             await asyncio.sleep(1)
     except (KeyboardInterrupt, asyncio.CancelledError):
         print_warning("\n[STOP] Shutting down all accounts...")
+        daily_manager_task.cancel()
+        try:
+            await daily_manager_task
+        except (asyncio.CancelledError, Exception):
+            pass
         for t in list(bot_state.account_workers.values()):
             if not t.done():
                 t.cancel()
