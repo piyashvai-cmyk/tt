@@ -8,6 +8,7 @@ import asyncio
 import json
 import os
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Any, Optional
 from aiohttp import web
 
@@ -23,6 +24,69 @@ class BotState:
         self.account_workers: Dict[str, asyncio.Task] = {}
         self.refresh_callbacks: Dict[str, Any] = {}
         self.account_credentials: Dict[str, Dict[str, Any]] = {}
+        self.daily_limit_file = "daily_limits.json"
+        self.daily_limits: Dict[str, Dict[str, Any]] = self._load_daily_limits()
+
+    @staticmethod
+    def _bd_now():
+        return datetime.now(timezone(timedelta(hours=6)))
+
+    @classmethod
+    def current_cycle_date(cls) -> str:
+        now = cls._bd_now()
+        if now.hour < 7:
+            now -= timedelta(days=1)
+        return now.date().isoformat()
+
+    def _load_daily_limits(self) -> Dict[str, Dict[str, Any]]:
+        try:
+            with open("daily_limits.json", "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError, TypeError):
+            return {}
+
+    def save_daily_limits(self) -> None:
+        tmp = self.daily_limit_file + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.daily_limits, f, indent=2, ensure_ascii=False)
+            os.replace(tmp, self.daily_limit_file)
+        except OSError as exc:
+            self.log(f"Could not save daily XP state: {exc}", "error")
+
+    def ensure_daily_state(self, uid: str, current_exp: int = 0) -> Dict[str, Any]:
+        uid = str(uid)
+        state = self.daily_limits.get(uid)
+        if not isinstance(state, dict):
+            state = {
+                "cycle_date": self.current_cycle_date(),
+                "daily_gained_exp": 0,
+                "daily_paused": False,
+                "manual_paused": False,
+                "last_exp": int(current_exp or 0),
+            }
+            self.daily_limits[uid] = state
+            self.save_daily_limits()
+        state.setdefault("cycle_date", self.current_cycle_date())
+        state.setdefault("daily_gained_exp", 0)
+        state.setdefault("daily_paused", False)
+        state.setdefault("manual_paused", False)
+        state.setdefault("last_exp", int(current_exp or 0))
+        return state
+
+    def set_manual_pause(self, uid: str, paused: bool) -> None:
+        state = self.ensure_daily_state(uid, self.accounts.get(str(uid), {}).get("current_exp", 0))
+        state["manual_paused"] = bool(paused)
+        self.save_daily_limits()
+        acc = self.accounts.get(str(uid))
+        if acc is not None:
+            acc["manual_paused"] = bool(paused)
+
+    def remove_daily_state(self, uid: str) -> None:
+        if str(uid) in self.daily_limits:
+            self.daily_limits.pop(str(uid), None)
+            self.save_daily_limits()
 
     def log(self, message: str, level: str = "info", uid: Optional[str] = None):
         entry = {
@@ -39,6 +103,8 @@ class BotState:
         uid_str = str(uid)
         lvl_val = max(1, int(level or 1))
         default_mode = "BR"
+        daily = self.ensure_daily_state(uid_str, exp)
+        initially_paused = bool(daily.get("manual_paused") or daily.get("daily_paused"))
         if uid_str not in self.accounts:
             self.accounts[uid_str] = {
                 "uid": uid_str,
@@ -48,10 +114,15 @@ class BotState:
                 "initial_exp": exp,
                 "current_exp": exp,
                 "gained_exp": 0,
+                "daily_gained_exp": int(daily.get("daily_gained_exp", 0) or 0),
+                "daily_limit_exp": 40000,
+                "daily_paused": bool(daily.get("daily_paused")),
+                "manual_paused": bool(daily.get("manual_paused")),
+                "is_paused": initially_paused,
                 "likes": likes or 0,
                 "mode": default_mode,
                 "mode_manual": False,
-                "status": "ONLINE",
+                "status": "PAUSED" if initially_paused else "ONLINE",
                 "matches_played": 0,
                 "active_matches": 0,
                 "last_match_time": None,
@@ -68,10 +139,14 @@ class BotState:
                 acc["level"] = lvl_val
             acc["current_exp"] = exp
             acc["gained_exp"] = max(0, exp - acc["initial_exp"])
+            acc["daily_gained_exp"] = int(daily.get("daily_gained_exp", 0) or 0)
+            acc["daily_paused"] = bool(daily.get("daily_paused"))
+            acc["manual_paused"] = bool(daily.get("manual_paused"))
+            acc["is_paused"] = bool(daily.get("manual_paused") or daily.get("daily_paused"))
             acc["likes"] = likes
             if not acc.get("mode_manual", False):
                 acc["mode"] = "BR"
-            acc["status"] = "ONLINE"
+            acc["status"] = "PAUSED" if acc["is_paused"] else "ONLINE"
             acc["last_updated"] = time.strftime("%H:%M:%S")
         self.recalc_totals()
 
@@ -94,7 +169,16 @@ class BotState:
             acc["gained_exp"] = max(0, current_exp - acc["initial_exp"])
             acc["last_updated"] = time.strftime("%H:%M:%S")
             diff = current_exp - old_exp
+            daily = self.ensure_daily_state(uid_str, current_exp)
             if diff > 0:
+                daily["daily_gained_exp"] = int(daily.get("daily_gained_exp", 0) or 0) + diff
+            daily["last_exp"] = int(current_exp)
+            acc["daily_gained_exp"] = int(daily.get("daily_gained_exp", 0) or 0)
+            acc["daily_paused"] = bool(daily.get("daily_paused"))
+            acc["manual_paused"] = bool(daily.get("manual_paused"))
+            acc["is_paused"] = bool(daily.get("manual_paused") or daily.get("daily_paused"))
+            if diff > 0:
+                self.save_daily_limits()
                 self.log(
                     f"Account {acc['nickname']} ({uid_str}) gained +{diff} EXP! "
                     f"Total Gained: +{acc['gained_exp']} | Mode: {acc['mode']}",
@@ -242,39 +326,51 @@ async def handle_add_account(request: web.Request) -> web.Response:
 
 
 async def handle_delete_account(request: web.Request) -> web.Response:
+    """Stop the live worker before removing credentials and dashboard state."""
     try:
         data = await request.json()
-        uid = str(data.get("uid", "")).strip()
-        token = str(data.get("token", "")).strip()
-        accounts_file = "accounts.json"
-        if os.path.exists(accounts_file):
-            with open(accounts_file, "r", encoding="utf-8") as f:
-                existing = json.load(f)
-            if token:
-                existing = [acc for acc in existing if str(acc.get("token", "")).strip() != token]
-            elif uid:
-                existing = [acc for acc in existing if str(acc.get("uid", "")).strip() != uid]
-            with open(accounts_file, "w", encoding="utf-8") as f:
-                json.dump(existing, f, indent=2)
+        uid = str(data.get("uid", "") or "").strip()
+        auth_uid = str(data.get("auth_uid", "") or "").strip()
+        token = str(data.get("token", "") or "").strip()
+        target_uid = uid or auth_uid
+        if not target_uid and not token:
+            return web.json_response({"status": "error", "error": "UID or token is required"}, status=400)
 
-        worker_keys = []
-        if uid:
-            worker_keys.append(uid)
-        if token:
-            worker_keys.append(token[:10])
-        for key in worker_keys:
-            worker = bot_state.account_workers.get(key)
-            if worker:
-                if not worker.done():
-                    worker.cancel()
-                bot_state.account_workers.pop(key, None)
+        # Let the main bot resolve token-backed workers and await cancellation.
+        credentials = bot_state.account_credentials.get(target_uid, {}) if target_uid else {}
+        callback = bot_state.refresh_callbacks.get("on_account_delete")
+        if callback:
+            # Pass both the displayed game UID and the original login UID.
+            # Guest workers are keyed by the original login UID, not game UID.
+            await callback(target_uid, token, auth_uid)
 
-        if uid and uid in bot_state.accounts:
-            del bot_state.accounts[uid]
-        bot_state.log(f"Account {uid or token[:10] or 'unknown'} removed from rotation.", "warning", uid or None)
-        return web.json_response({"status": "ok"})
+        accounts = await _load_accounts_file()
+        target_token = token or str(credentials.get("auth_token", "") or "")
+        kept = []
+        for item in accounts:
+            item_uid = str(item.get("uid", "") or "").strip()
+            item_token = str(item.get("token", "") or "").strip()
+            matches = (target_uid and item_uid in {target_uid, auth_uid}) or (target_token and item_token == target_token)
+            if not matches:
+                kept.append(item)
+        _save_accounts_file(kept)
+
+        # Remove dashboard rows and cached credentials associated with this account.
+        ids_to_remove = {x for x in (uid, auth_uid) if x}
+        for key, value in list(bot_state.account_credentials.items()):
+            if key in ids_to_remove or (target_token and str(value.get("auth_token", "")) == target_token):
+                ids_to_remove.add(str(value.get("account_id", "")))
+                bot_state.account_credentials.pop(key, None)
+        ids_to_remove.add(str(target_uid or ""))
+        for account_id in ids_to_remove:
+            if account_id:
+                bot_state.accounts.pop(account_id, None)
+                bot_state.remove_daily_state(account_id)
+        bot_state.recalc_totals()
+        bot_state.log(f"Account {target_uid or (target_token[:10] + '…')} deleted; worker stopped.", "warning", target_uid or None)
+        return web.json_response({"status": "ok", "deleted": target_uid or target_token[:10]})
     except Exception as e:
-        return web.json_response({"status": "error", "error": str(e)})
+        return web.json_response({"status": "error", "error": str(e)}, status=500)
 
 
 async def _load_accounts_file() -> List[Dict[str, Any]]:
@@ -406,9 +502,129 @@ async def handle_delete_all_accounts(request: web.Request) -> web.Response:
         _save_accounts_file([])
         bot_state.accounts.clear()
         bot_state.account_credentials.clear()
+        bot_state.daily_limits.clear()
+        bot_state.save_daily_limits()
         bot_state.recalc_totals()
         bot_state.log(f"All accounts deleted. {removed} account(s) removed from rotation.", "warning")
         return web.json_response({"status": "ok", "removed": removed})
+    except Exception as e:
+        return web.json_response({"status": "error", "error": str(e)}, status=500)
+
+
+async def handle_pause_account(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+        uid = str(data.get("uid", "") or "").strip()
+        if not uid or uid not in bot_state.accounts:
+            return web.json_response({"status": "error", "error": "Account not found"}, status=404)
+        acc = bot_state.accounts[uid]
+        daily = bot_state.ensure_daily_state(uid, acc.get("current_exp", 0))
+        is_paused = bool(acc.get("is_paused", False) or acc.get("manual_paused") or acc.get("daily_paused") or str(acc.get("status", "")).upper() == "PAUSED")
+
+        if not is_paused:
+            callback = bot_state.refresh_callbacks.get("on_account_pause")
+            if not callback:
+                return web.json_response({"status": "error", "error": "Pause handler unavailable"}, status=503)
+            bot_state.set_manual_pause(uid, True)
+            await callback(uid)
+            acc["is_paused"] = True
+            acc["status"] = "PAUSED"
+            acc["active_matches"] = 0
+            bot_state.log(f"Account {uid} manually paused.", "warning", uid)
+            return web.json_response({"status": "ok", "uid": uid, "is_paused": True})
+
+        # The daily cap cannot be bypassed by pressing Resume. Manual pause can be
+        # cleared, but the account remains off until the next 07:00 Bangladesh reset.
+        if bool(daily.get("daily_paused")) or int(daily.get("daily_gained_exp", 0) or 0) >= 40000:
+            daily["daily_paused"] = True
+            bot_state.save_daily_limits()
+            acc["daily_paused"] = True
+            acc["is_paused"] = True
+            acc["status"] = "PAUSED"
+            return web.json_response({"status": "error", "error": "Daily limit reached (40,000 EXP). Account will resume at 07:00 Bangladesh time unless manually paused.", "daily_paused": True}, status=409)
+
+        callback = bot_state.refresh_callbacks.get("on_account_resume")
+        if not callback:
+            return web.json_response({"status": "error", "error": "Resume handler unavailable"}, status=503)
+        bot_state.set_manual_pause(uid, False)
+        result = await callback(uid)
+        if result is False:
+            bot_state.set_manual_pause(uid, True)
+            acc["status"] = "PAUSED"
+            acc["is_paused"] = True
+            return web.json_response({"status": "error", "error": "Saved login credentials not found; account was not resumed"}, status=409)
+        acc["is_paused"] = False
+        acc["manual_paused"] = False
+        acc["status"] = "CONNECTING"
+        acc["active_matches"] = 0
+        acc["last_updated"] = time.strftime("%H:%M:%S")
+        bot_state.log(f"Account {uid} resumed manually.", "success", uid)
+        return web.json_response({"status": "ok", "uid": uid, "is_paused": False})
+    except Exception as e:
+        return web.json_response({"status": "error", "error": str(e)}, status=500)
+
+
+async def handle_pause_all(request: web.Request) -> web.Response:
+    try:
+        accounts = list(bot_state.accounts.items())
+        all_paused = bool(accounts) and all(bool(acc.get("is_paused") or acc.get("status") == "PAUSED") for _, acc in accounts)
+        pause_now = not all_paused
+        callback_name = "on_account_pause" if pause_now else "on_account_resume"
+        callback = bot_state.refresh_callbacks.get(callback_name)
+        if not callback:
+            return web.json_response({"status": "error", "error": f"{callback_name} handler unavailable"}, status=503)
+        for uid, acc in accounts:
+            daily = bot_state.ensure_daily_state(uid, acc.get("current_exp", 0))
+            if pause_now:
+                bot_state.set_manual_pause(uid, True)
+                await callback(uid)
+                acc["is_paused"] = True
+                acc["status"] = "PAUSED"
+            else:
+                bot_state.set_manual_pause(uid, False)
+                if bool(daily.get("daily_paused")) or int(daily.get("daily_gained_exp", 0) or 0) >= 40000:
+                    daily["daily_paused"] = True
+                    acc["daily_paused"] = True
+                    acc["is_paused"] = True
+                    acc["status"] = "PAUSED"
+                    continue
+                result = await callback(uid)
+                if result is False:
+                    acc["status"] = "OFFLINE"
+                    acc["is_paused"] = False
+                    continue
+                acc["is_paused"] = False
+                acc["status"] = "CONNECTING"
+            acc["active_matches"] = 0
+            acc["last_updated"] = time.strftime("%H:%M:%S")
+        bot_state.save_daily_limits()
+        bot_state.log("All accounts manually paused." if pause_now else "All eligible accounts resumed; daily-capped accounts remain paused until 07:00 BD time.", "warning" if pause_now else "success")
+        return web.json_response({"status": "ok", "all_paused": pause_now})
+    except Exception as e:
+        return web.json_response({"status": "error", "error": str(e)}, status=500)
+
+
+async def handle_restart_account(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+        uid = str(data.get("uid", "") or "").strip()
+        if not uid or uid not in bot_state.accounts:
+            return web.json_response({"status": "error", "error": "Account not found"}, status=404)
+        daily = bot_state.ensure_daily_state(uid, bot_state.accounts[uid].get("current_exp", 0))
+        if bool(daily.get("manual_paused")):
+            return web.json_response({"status": "error", "error": "Account is manually paused. Resume it first."}, status=409)
+        if bool(daily.get("daily_paused")) or int(daily.get("daily_gained_exp", 0) or 0) >= 40000:
+            return web.json_response({"status": "error", "error": "Daily 40,000 EXP limit reached. Account will resume at 07:00 Bangladesh time."}, status=409)
+        callback = bot_state.refresh_callbacks.get("on_account_restart")
+        if not callback:
+            return web.json_response({"status": "error", "error": "Restart handler unavailable"}, status=503)
+        result = await callback(uid)
+        if result is False:
+            return web.json_response({"status": "error", "error": "Saved credentials not found; account was not restarted"}, status=409)
+        bot_state.accounts[uid]["is_paused"] = False
+        bot_state.accounts[uid]["status"] = "CONNECTING"
+        bot_state.accounts[uid]["active_matches"] = 0
+        return web.json_response({"status": "ok", "uid": uid})
     except Exception as e:
         return web.json_response({"status": "error", "error": str(e)}, status=500)
 
@@ -452,6 +668,9 @@ async def start_web_dashboard(host: str = "0.0.0.0", port: int = 5000):
     app.router.add_get("/api/stats", handle_get_stats)
     app.router.add_post("/api/account/add", handle_add_account)
     app.router.add_post("/api/account/delete", handle_delete_account)
+    app.router.add_post("/api/account/pause", handle_pause_account)
+    app.router.add_post("/api/account/pause_all", handle_pause_all)
+    app.router.add_post("/api/account/restart", handle_restart_account)
     app.router.add_post("/api/account/import", handle_batch_import)
     app.router.add_post("/api/account/delete-all", handle_delete_all_accounts)
     app.router.add_get("/health", handle_health)
