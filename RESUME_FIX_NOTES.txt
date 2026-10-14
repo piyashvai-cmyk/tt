@@ -1,0 +1,15 @@
+Resume/Worker Lifecycle Fixes
+
+Changes in this build:
+- Resume resolves the dashboard's in-game UID to the saved login UID/token before starting a worker.
+- Resume can recover from the live credential cache when the account is still present in the dashboard but the saved entry cannot be directly matched.
+- A worker already running under the resolved credential key is not started twice.
+- Finished worker tasks remove their own registry entry only if it still points to that exact task.
+- The Pause/Resume endpoint now honors status=PAUSED as well as is_paused, preventing stale UI/backend state from toggling the wrong direction.
+- Resume failures return an explicit error and keep the account in a paused/offline state rather than reporting success.
+- accounts.json is intentionally empty ([]) so no prior account IDs/passwords are bundled.
+
+Validation performed:
+- Python syntax compilation passed for main-fix.py and dashboard_server.py.
+- ZIP integrity checked after packaging.
+- No live game-server session was run here; verify Resume with one test account and review the dashboard logs.
